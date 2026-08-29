@@ -406,6 +406,12 @@ func (h *Handler) compileIssueTableQuery(w http.ResponseWriter, r *http.Request,
 		return issueTableSQL{}, false
 	}
 
+	accessible, allAccess, accessErr := h.accessibleProjectIDs(r.Context(), r, workspaceID)
+	if accessErr != nil {
+		writeError(w, http.StatusInternalServerError, "failed to resolve project access")
+		return issueTableSQL{}, false
+	}
+
 	where := []string{"i.workspace_id = $1"}
 	args := []any{workspaceUUID}
 	addArg := func(value any) string {
@@ -463,7 +469,11 @@ func (h *Handler) compileIssueTableQuery(w http.ResponseWriter, r *http.Request,
 			writeError(w, http.StatusBadRequest, "invalid scope.project_id")
 			return issueTableSQL{}, false
 		}
-		where = append(where, fmt.Sprintf("i.project_id = %s::uuid", addArg(projectID)))
+		if !allAccess && !h.canAccessProject(r.Context(), r, workspaceID, projectID) {
+			where = append(where, "FALSE")
+		} else {
+			where = append(where, fmt.Sprintf("i.project_id = %s::uuid", addArg(projectID)))
+		}
 		if !appendAssigneeTypes() {
 			return issueTableSQL{}, false
 		}
@@ -560,15 +570,22 @@ func (h *Handler) compileIssueTableQuery(w http.ResponseWriter, r *http.Request,
 	if !ok {
 		return issueTableSQL{}, false
 	}
-	if len(projectIDs) > 0 || spec.Filters.IncludeNoProject {
+	projectIDs, includeNoProject, projectFilterEmpty := restrictProjectFilter(allAccess, accessible, projectIDs, spec.Filters.IncludeNoProject)
+	if projectFilterEmpty {
+		where = append(where, "FALSE")
+	} else if !allAccess || len(projectIDs) > 0 || includeNoProject {
 		ors := make([]string, 0, 2)
 		if len(projectIDs) > 0 {
 			ors = append(ors, fmt.Sprintf("i.project_id = ANY(%s::uuid[])", addArg(projectIDs)))
 		}
-		if spec.Filters.IncludeNoProject {
+		if includeNoProject {
 			ors = append(ors, "i.project_id IS NULL")
 		}
-		where = append(where, "("+strings.Join(ors, " OR ")+")")
+		if len(ors) == 0 {
+			where = append(where, "FALSE")
+		} else {
+			where = append(where, "("+strings.Join(ors, " OR ")+")")
+		}
 	}
 
 	labelIDs, ok := parseIssueTableUUIDList(w, spec.Filters.LabelIDs, "filters.label_ids")

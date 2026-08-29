@@ -17,8 +17,10 @@ import (
 // `X-User-ID` header — so downstream handlers don't have to care which
 // token kind the caller used:
 //
-//   - JWT cookie / mul_ PAT  → X-User-ID = the human's user id.
+//   - JWT cookie             → X-User-ID = the human's user id.
 //     X-Actor-Source is left empty.
+//   - mul_ PAT               → X-User-ID = the human's user id,
+//     plus `X-Actor-Source: pat` (project ACL bypass).
 //   - mat_ task token        → X-User-ID = the OWNING human's user id,
 //     plus X-Agent-ID, X-Task-ID, and the
 //     authoritative server-set header

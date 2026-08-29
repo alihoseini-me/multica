@@ -886,17 +886,41 @@ func (h *Handler) SearchIssues(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+
+	accessible, allAccess, err := h.accessibleProjectIDs(ctx, r, workspaceID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to resolve project access")
+		return
+	}
+	if !allAccess && len(accessible) == 0 {
+		w.Header().Set("X-Total-Count", "0")
+		writeJSON(w, http.StatusOK, map[string]any{
+			"issues": []SearchIssueResponse{},
+			"total":  0,
+		})
+		return
+	}
+
 	terms := splitSearchTerms(q)
 	queryNum, hasNum := parseQueryNumber(q)
 
 	sqlQuery, args := buildSearchQuery(q, terms, queryNum, hasNum, includeClosed)
 	// Fill placeholder args: $4 = workspace_id, last two = limit, offset
 	args[3] = wsUUID
+	if !allAccess {
+		// Inject accessible-project restriction before LIMIT/OFFSET placeholders.
+		limitPlaceholder := args[len(args)-2]
+		offsetPlaceholder := args[len(args)-1]
+		args = args[:len(args)-2]
+		args = append(args, accessible, limitPlaceholder, offsetPlaceholder)
+		projParam := "$" + strconv.Itoa(len(args)-2)
+		sqlQuery = strings.Replace(sqlQuery, "\n\tORDER BY", " AND i.project_id = ANY("+projParam+"::uuid[])\n\tORDER BY", 1)
+	}
 	args[len(args)-2] = limit
 	args[len(args)-1] = offset
 
 	var results []searchResult
-	err := runSearchQuery(ctx, h.TxStarter, sqlQuery, args, func(rows pgx.Rows) error {
+	err = runSearchQuery(ctx, h.TxStarter, sqlQuery, args, func(rows pgx.Rows) error {
 		for rows.Next() {
 			var sr searchResult
 			if err := rows.Scan(
@@ -1020,6 +1044,12 @@ func (h *Handler) ListIssues(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	accessible, allAccess, err := h.accessibleProjectIDs(ctx, r, workspaceID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to resolve project access")
+		return
+	}
+
 	// Parse optional filter params. Malformed UUIDs in filters return 400 —
 	// silently coercing them to a zero UUID would mask a client bug and let
 	// the query return an empty result set (or worse, match a NULL row).
@@ -1090,8 +1120,26 @@ func (h *Handler) ListIssues(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	writeEmptyIssueList := func() {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"issues": []IssueResponse{},
+			"total":  0,
+		})
+	}
+
 	// open_only=true returns all non-done/cancelled issues (no limit).
 	if r.URL.Query().Get("open_only") == "true" {
+		if !allAccess {
+			if projectFilter.Valid {
+				if !h.canAccessProject(ctx, r, workspaceID, projectFilter) {
+					writeEmptyIssueList()
+					return
+				}
+			} else if len(accessible) == 0 {
+				writeEmptyIssueList()
+				return
+			}
+		}
 		// Serialize the parsed AND-of-ORs groups into the single jsonb param
 		// the static query unrolls (see properties_filter in ListOpenIssues).
 		var openPropertiesFilter []byte
@@ -1117,6 +1165,24 @@ func (h *Handler) ListIssues(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to list issues")
 			return
+		}
+
+		if !allAccess && !projectFilter.Valid {
+			allowed := make(map[[16]byte]struct{}, len(accessible))
+			for _, id := range accessible {
+				if id.Valid {
+					allowed[id.Bytes] = struct{}{}
+				}
+			}
+			filtered := issues[:0]
+			for _, issue := range issues {
+				if issue.ProjectID.Valid {
+					if _, ok := allowed[issue.ProjectID.Bytes]; ok {
+						filtered = append(filtered, issue)
+					}
+				}
+			}
+			issues = filtered
 		}
 
 		prefix := h.getIssuePrefix(ctx, wsUUID)
@@ -1299,6 +1365,10 @@ func (h *Handler) ListIssues(w http.ResponseWriter, r *http.Request) {
 		where = append(where, fmt.Sprintf("i.creator_id = %s::uuid", addArg(creatorFilter)))
 	}
 	if projectFilter.Valid {
+		if !allAccess && !h.canAccessProject(ctx, r, workspaceID, projectFilter) {
+			writeEmptyIssueList()
+			return
+		}
 		where = append(where, fmt.Sprintf("i.project_id = %s::uuid", addArg(projectFilter)))
 	}
 
@@ -1346,13 +1416,24 @@ func (h *Handler) ListIssues(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	includeNoProject := r.URL.Query().Get("include_no_project") == "true"
-	if len(projectIDs) > 0 || includeNoProject {
+	projectIDs, includeNoProject, projectFilterEmpty := restrictProjectFilter(allAccess, accessible, projectIDs, includeNoProject)
+	if projectFilterEmpty {
+		writeEmptyIssueList()
+		return
+	}
+	// Restricted members always need an explicit project predicate (null-project
+	// issues are hidden). allAccess callers keep the prior optional behavior.
+	if !allAccess || len(projectIDs) > 0 || includeNoProject {
 		ors := make([]string, 0, 2)
 		if len(projectIDs) > 0 {
 			ors = append(ors, fmt.Sprintf("i.project_id = ANY(%s::uuid[])", addArg(projectIDs)))
 		}
 		if includeNoProject {
 			ors = append(ors, "i.project_id IS NULL")
+		}
+		if len(ors) == 0 {
+			writeEmptyIssueList()
+			return
 		}
 		where = append(where, "("+strings.Join(ors, " OR ")+")")
 	}
@@ -1721,6 +1802,12 @@ func (h *Handler) ListGroupedIssues(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	accessible, allAccess, err := h.accessibleProjectIDs(r.Context(), r, workspaceID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to resolve project access")
+		return
+	}
+
 	limit := 50
 	offset := 0
 	if l := r.URL.Query().Get("limit"); l != "" {
@@ -1814,6 +1901,10 @@ func (h *Handler) ListGroupedIssues(w http.ResponseWriter, r *http.Request) {
 	if raw := r.URL.Query().Get("project_id"); raw != "" {
 		id, ok := parseUUIDOrBadRequest(w, raw, "project_id")
 		if !ok {
+			return
+		}
+		if !allAccess && !h.canAccessProject(r.Context(), r, workspaceID, id) {
+			writeJSON(w, http.StatusOK, GroupedIssuesResponse{Groups: []IssueAssigneeGroupResponse{}})
 			return
 		}
 		where = append(where, fmt.Sprintf("i.project_id = %s::uuid", addArg(id)))
@@ -1914,13 +2005,22 @@ func (h *Handler) ListGroupedIssues(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	includeNoProject := r.URL.Query().Get("include_no_project") == "true"
-	if len(projectIDs) > 0 || includeNoProject {
+	projectIDs, includeNoProject, projectFilterEmpty := restrictProjectFilter(allAccess, accessible, projectIDs, includeNoProject)
+	if projectFilterEmpty {
+		writeJSON(w, http.StatusOK, GroupedIssuesResponse{Groups: []IssueAssigneeGroupResponse{}})
+		return
+	}
+	if !allAccess || len(projectIDs) > 0 || includeNoProject {
 		ors := make([]string, 0, 2)
 		if len(projectIDs) > 0 {
 			ors = append(ors, fmt.Sprintf("i.project_id = ANY(%s::uuid[])", addArg(projectIDs)))
 		}
 		if includeNoProject {
 			ors = append(ors, "i.project_id IS NULL")
+		}
+		if len(ors) == 0 {
+			writeJSON(w, http.StatusOK, GroupedIssuesResponse{Groups: []IssueAssigneeGroupResponse{}})
+			return
 		}
 		where = append(where, "("+strings.Join(ors, " OR ")+")")
 	}
@@ -2800,6 +2900,10 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 		}
 		projectID = id
 	}
+	if !h.canAccessProject(r.Context(), r, workspaceID, projectID) {
+		writeError(w, http.StatusNotFound, "project not found")
+		return
+	}
 	if req.ParentIssueID != nil {
 		id, ok := parseUUIDOrBadRequest(w, *req.ParentIssueID, "parent_issue_id")
 		if !ok {
@@ -3413,9 +3517,17 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 				writeError(w, http.StatusBadRequest, "project not found in this workspace")
 				return
 			}
+			if !h.canAccessProject(r.Context(), r, workspaceID, projectUUID) {
+				writeError(w, http.StatusNotFound, "project not found")
+				return
+			}
 			params.ProjectID = projectUUID
 		} else {
 			params.ProjectID = pgtype.UUID{Valid: false}
+			if !h.canAccessProject(r.Context(), r, workspaceID, params.ProjectID) {
+				writeError(w, http.StatusForbidden, "insufficient permissions")
+				return
+			}
 		}
 	}
 	if _, ok := rawFields["stage"]; ok {
@@ -3953,7 +4065,17 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "project not found in this workspace")
 			return
 		}
+		if !h.canAccessProject(r.Context(), r, workspaceID, projectUUID) {
+			writeError(w, http.StatusNotFound, "project not found")
+			return
+		}
 		batchProjectID = projectUUID
+	} else if _, ok := rawUpdates["project_id"]; ok && req.Updates.ProjectID == nil {
+		// Explicit null clears project — only allAccess principals may.
+		if !h.canAccessProject(r.Context(), r, workspaceID, pgtype.UUID{Valid: false}) {
+			writeError(w, http.StatusForbidden, "insufficient permissions")
+			return
+		}
 	}
 
 	updated := 0
@@ -3974,6 +4096,9 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 			WorkspaceID: wsUUID,
 		})
 		if err != nil {
+			continue
+		}
+		if !h.canAccessProject(r.Context(), r, workspaceID, prevIssue.ProjectID) {
 			continue
 		}
 
@@ -4251,6 +4376,9 @@ func (h *Handler) BatchDeleteIssues(w http.ResponseWriter, r *http.Request) {
 			WorkspaceID: wsUUID,
 		})
 		if err != nil {
+			continue
+		}
+		if !h.canAccessProject(r.Context(), r, workspaceID, issue.ProjectID) {
 			continue
 		}
 

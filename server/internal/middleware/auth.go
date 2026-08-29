@@ -53,11 +53,11 @@ func Auth(queries *db.Queries, patCache *auth.PATCache, cloudPAT *auth.CloudPATV
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// X-Actor-Source is server-set only — any value supplied by
 			// the client is untrusted and discarded before the auth
-			// branches run. Only the mat_ branch below re-sets it. This
-			// is what prevents a client from sending a normal mul_ PAT
-			// plus a forged `X-Actor-Source: member` (or anything else)
-			// to convince a downstream handler that its request came
-			// from a non-task-token path.
+			// branches run. Only the mat_ / mcn_ / mul_ branches below
+			// re-set it. This is what prevents a client from sending a
+			// normal JWT session plus a forged `X-Actor-Source: pat`
+			// (or anything else) to convince a downstream handler that
+			// its request came from a privileged auth path.
 			r.Header.Del("X-Actor-Source")
 
 			tokenString, fromCookie := extractToken(r)
@@ -187,6 +187,7 @@ func Auth(queries *db.Queries, patCache *auth.PATCache, cloudPAT *auth.CloudPATV
 						return
 					}
 					r.Header.Set("X-User-ID", userID)
+					r.Header.Set("X-Actor-Source", "pat")
 					next.ServeHTTP(w, r)
 					return
 				}
@@ -207,6 +208,7 @@ func Auth(queries *db.Queries, patCache *auth.PATCache, cloudPAT *auth.CloudPATV
 					return
 				}
 				r.Header.Set("X-User-ID", userID)
+				r.Header.Set("X-Actor-Source", "pat")
 
 				// Clamp cache TTL to the token's remaining lifetime so a
 				// PAT expiring in <AuthCacheTTL can't continue passing

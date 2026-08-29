@@ -120,6 +120,11 @@ func (h *Handler) ListProjects(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	accessible, allAccess, err := h.accessibleProjectIDs(r.Context(), r, workspaceID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to resolve project access")
+		return
+	}
 	var statusFilter pgtype.Text
 	if s := r.URL.Query().Get("status"); s != "" {
 		statusFilter = pgtype.Text{String: s, Valid: true}
@@ -136,6 +141,22 @@ func (h *Handler) ListProjects(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list projects")
 		return
+	}
+
+	if !allAccess {
+		allowed := make(map[[16]byte]struct{}, len(accessible))
+		for _, id := range accessible {
+			if id.Valid {
+				allowed[id.Bytes] = struct{}{}
+			}
+		}
+		filtered := projects[:0]
+		for _, p := range projects {
+			if _, ok := allowed[p.ID.Bytes]; ok {
+				filtered = append(filtered, p)
+			}
+		}
+		projects = filtered
 	}
 
 	// Batch-fetch issue stats and resource counts for all projects
@@ -187,6 +208,10 @@ func (h *Handler) GetProject(w http.ResponseWriter, r *http.Request) {
 		ID: idUUID, WorkspaceID: wsUUID,
 	})
 	if err != nil {
+		writeError(w, http.StatusNotFound, "project not found")
+		return
+	}
+	if !h.canAccessProject(r.Context(), r, workspaceID, project.ID) {
 		writeError(w, http.StatusNotFound, "project not found")
 		return
 	}

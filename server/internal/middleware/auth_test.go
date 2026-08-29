@@ -323,9 +323,11 @@ func TestAuth_PATCacheHit(t *testing.T) {
 	cache.Set(context.Background(), hash, "cached-user-id", auth.AuthCacheTTL)
 
 	var gotUserID string
+	var gotActorSource string
 	mw := Auth(nil, cache, nil) // nil queries — only safe on cache hit
 	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotUserID = r.Header.Get("X-User-ID")
+		gotActorSource = r.Header.Get("X-Actor-Source")
 		w.WriteHeader(http.StatusOK)
 	}))
 
@@ -339,6 +341,9 @@ func TestAuth_PATCacheHit(t *testing.T) {
 	}
 	if gotUserID != "cached-user-id" {
 		t.Fatalf("expected cached X-User-ID, got %q", gotUserID)
+	}
+	if gotActorSource != "pat" {
+		t.Fatalf("expected X-Actor-Source=pat on mul_ cache hit, got %q", gotActorSource)
 	}
 }
 
